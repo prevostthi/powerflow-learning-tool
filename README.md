@@ -169,10 +169,9 @@ The format is directly compatible with:
 
 | Tool | Use case |
 |------|----------|
-| [Powsybl-Desktop](https://github.com/powsybl/powsybl-desktop) | Network visualisation and editing |
+
 | [Dynawo](https://dynawo.github.io/) | Transient dynamic simulation |
 | [PyPowSybl](https://pypowsybl.readthedocs.io/) | Security analysis, OPF, short-circuit |
-| [GridPy-Visu](https://github.com/powsybl/gridpy-visu) | Web-based visualisation |
 
 ---
 
