@@ -35,13 +35,17 @@ NODES = [
 ]
 
 GENERATORS = [
-    {"id":"SM1", "node":"N1","name":"Machine Sync. 1","type":"synchronous",
+    {"id":"SM1",  "node":"N1","name":"Machine Sync. 1","type":"synchronous",
+     "energy_source":"NUCLEAR",
      "P_mw":80,"V_pu":1.02,"P_min":10,"P_max":150,"V_min":0.95,"V_max":1.05},
-    {"id":"SM2", "node":"N2","name":"Machine Sync. 2","type":"synchronous",
+    {"id":"SM2",  "node":"N2","name":"Machine Sync. 2","type":"synchronous",
+     "energy_source":"NUCLEAR",
      "P_mw":60,"V_pu":1.01,"P_min":10,"P_max":120,"V_min":0.95,"V_max":1.05},
-    {"id":"WIND","node":"N3","name":"Parc Eolien",    "type":"wind",
+    {"id":"WIND", "node":"N3","name":"Parc Eolien",    "type":"wind",
+     "energy_source":"WIND",
      "P_mw":30,"Q_mvar":5,"P_min":0,"P_max":80,"Q_min":-20,"Q_max":20},
-    {"id":"PVSOL","node":"N4","name":"Centrale PV",   "type":"solar",
+    {"id":"PVSOL","node":"N4","name":"Centrale PV",    "type":"solar",
+     "energy_source":"SOLAR",
      "P_mw":25,"Q_mvar":0,"P_min":0,"P_max":60,"Q_min":-15,"Q_max":15},
 ]
 
@@ -126,7 +130,8 @@ def build_network(gen_setpoints: dict, load_setpoints: dict,
             id=[g["id"]], voltage_level_id=[nd["vl"]], bus_id=[nd["bus"]],
             target_p=[P], target_q=[Q], target_v=[V],
             voltage_regulator_on=[reg],
-            min_p=[g["P_min"]], max_p=[g["P_max"]])
+            min_p=[g["P_min"]], max_p=[g["P_max"]],
+            energy_source=[g.get("energy_source", "OTHER")])
 
     # Charges
     for l in LOADS:
@@ -224,57 +229,97 @@ def run_loadflow(net: pn.Network):
     status = lf_res[0].status
     iters  = lf_res[0].iteration_count
 
-    # Résultats bus
+    # Résultats bus — clé = voltage_level_id (fonctionne quel que soit le réseau)
     buses_raw = net.get_buses()[["v_mag","v_angle"]]
+    vls_raw   = net.get_voltage_levels()[["nominal_v","substation_id"]]
     node_results = {}
-    for nd in NODES:
-        vl_bus = nd["vl"] + "_0"   # convention pypowsybl : VL1_0
+
+    for vl_id in vls_raw.index:
+        vl_bus = vl_id + "_0"   # convention pypowsybl BUS_BREAKER
+        nom_kv = float(vls_raw.loc[vl_id, "nominal_v"])
         if vl_bus in buses_raw.index:
             row = buses_raw.loc[vl_bus]
-            V   = row["v_mag"] / BASE_KV
-            ang = row["v_angle"]
+            V_raw = row["v_mag"]
+            ang   = row["v_angle"]
+            V     = V_raw / nom_kv if nom_kv > 0 else 1.0
         else:
-            V, ang = 1.0, 0.0
-        node_results[nd["id"]] = {
+            V, ang, V_raw = 1.0, 0.0, nom_kv
+        node_results[vl_id] = {
             "V_pu":      V,
             "theta_deg": ang,
-            "V_kv":      V * BASE_KV,
+            "V_kv":      V_raw,
+            "nominal_kv": nom_kv,
         }
 
-    # Résultats générateurs (P, Q réellement injectés)
-    gens_raw = net.get_generators()[["p","q"]]
-    for g in GENERATORS:
-        gid = g["id"]
-        if gid in gens_raw.index:
-            # pypowsybl convention : p = injection donc P_mw = -p (load convention → generator)
-            node_results[g["node"]]["P_gen_mw"]  = -gens_raw.loc[gid,"p"]
-            node_results[g["node"]]["Q_gen_mvar"] = -gens_raw.loc[gid,"q"]
+    # Résultats générateurs — clé = voltage_level_id du générateur
+    gens_raw = net.get_generators()[["p","q","energy_source","voltage_regulator_on",
+                                      "voltage_level_id"]]
+    for gid, row in gens_raw.iterrows():
+        vl_id = row["voltage_level_id"]
+        if vl_id in node_results:
+            node_results[vl_id]["P_gen_mw"]      = -row["p"]
+            node_results[vl_id]["Q_gen_mvar"]    = -row["q"]
+            node_results[vl_id]["energy_source"] = row["energy_source"]
+            node_results[vl_id]["is_pv"]         = bool(row["voltage_regulator_on"])
 
-    # Résultats lignes
-    lines_raw  = net.get_lines()[["p1","q1","p2","q2","i1","i2"]]
+    # Résultats lignes — itère sur le réseau lui-même (pas sur la constante globale)
+    lines_rating = {l["id"]: l.get("rating_mva", 100) for l in LINES}
     line_results = {}
-    for l in LINES:
-        lid = l["id"]
-        if lid in lines_raw.index:
-            row = lines_raw.loc[lid]
-            # Taux de charge thermique : I1 en A → p.u. approx
-            I1_pu = row["i1"] / (BASE_MVA / (math.sqrt(3)*BASE_KV)*1000) \
-                    if row["i1"] == row["i1"] else 0.0
-            loading = I1_pu / (l["rating_mva"]/BASE_MVA) * 100 if I1_pu>0 else 0.0
-            P_loss  = row["p1"] + row["p2"]   # pertes = somme algébrique des transits
+    try:
+        lines_raw = net.get_lines()[["p1","q1","p2","q2","i1","i2","voltage_level1_id"]]
+        for lid, row in lines_raw.iterrows():
+            vl1_id  = row["voltage_level1_id"]
+            nom_kv  = float(vls_raw.loc[vl1_id,"nominal_v"]) if vl1_id in vls_raw.index else BASE_KV
+            i1      = row["i1"]
+            I1_pu   = (i1 / (BASE_MVA/(math.sqrt(3)*nom_kv)*1000)
+                       if (i1==i1 and nom_kv>0) else 0.0)
+            rating  = lines_rating.get(lid, 100)
+            loading = I1_pu / (rating/BASE_MVA) * 100 if I1_pu>0 else 0.0
+            P_loss  = row["p1"] + row["p2"]
             Q_loss  = row["q1"] + row["q2"]
             line_results[lid] = {
-                "P_from": row["p1"],  "Q_from": row["q1"],
-                "P_to":   row["p2"],  "Q_to":   row["q2"],
-                "P_loss": P_loss,     "Q_loss": Q_loss,
+                "P_from": row["p1"], "Q_from": row["q1"],
+                "P_to":   row["p2"], "Q_to":   row["q2"],
+                "P_loss": P_loss,    "Q_loss": Q_loss,
                 "loading_pct": loading,
+                "kind": "line",
             }
-        else:
-            line_results[lid] = {"P_from":0,"Q_from":0,"P_to":0,"Q_to":0,
-                                  "P_loss":0,"Q_loss":0,"loading_pct":0}
+    except Exception:
+        pass
+
+    # ── Résultats transformateurs (lus depuis l'IIDM — absent si réseau sans transfo)
+    transformer_results = {}
+    try:
+        t2w = net.get_2_windings_transformers()
+        if not t2w.empty:
+            t2w_res = t2w[["p1","q1","p2","q2","i1","rated_u1","rated_u2",
+                            "r","x","voltage_level1_id","voltage_level2_id",
+                            "bus1_id","bus2_id","connected1","connected2"]]
+            for tid, row in t2w_res.iterrows():
+                I_pu = row["i1"] / (BASE_MVA / (math.sqrt(3)*row["rated_u1"])*1000) \
+                       if row["i1"]==row["i1"] and row["rated_u1"]>0 else 0.0
+                # Taux de charge sur puissance nominale (estimé à rated_u²/x si pas de rated_s)
+                P_loss = row["p1"] + row["p2"]
+                Q_loss = row["q1"] + row["q2"]
+                transformer_results[tid] = {
+                    "P_from":   row["p1"],     "Q_from":   row["q1"],
+                    "P_to":     row["p2"],     "Q_to":     row["q2"],
+                    "P_loss":   P_loss,        "Q_loss":   Q_loss,
+                    "loading_pct": min(I_pu*100, 200),
+                    "rated_u1": row["rated_u1"], "rated_u2": row["rated_u2"],
+                    "R_pu":     row["r"],        "X_pu":     row["x"],
+                    "vl1":      row["voltage_level1_id"],
+                    "vl2":      row["voltage_level2_id"],
+                    "bus1":     row["bus1_id"],
+                    "bus2":     row["bus2_id"],
+                    "connected": row["connected1"] and row["connected2"],
+                    "kind": "transformer",
+                }
+    except Exception:
+        pass
 
     converged = (status == plf.ComponentStatus.CONVERGED)
-    return node_results, line_results, converged, iters, status
+    return node_results, line_results, transformer_results, converged, iters, status
 
 
 def save_iidm(net: pn.Network, path: str):
@@ -285,6 +330,230 @@ def save_iidm(net: pn.Network, path: str):
 def load_iidm(path: str) -> pn.Network:
     """Charge un fichier IIDM."""
     return pn.load(path)
+
+
+def read_diagram_positions(net: pn.Network) -> dict:
+    """
+    Lit les propriétés diagram_x / diagram_y stockées sur les voltage levels.
+    Retourne {vl_id: (x, y)} pour les VL qui ont ces propriétés.
+    Retourne un dict vide si aucune propriété n'est présente.
+    """
+    try:
+        props = net.get_elements_properties()
+        if props.empty:
+            return {}
+        pos = {}
+        for _, row in props.iterrows():
+            if row['key'] in ('diagram_x', 'diagram_y'):
+                vl_id = row.name
+                pos.setdefault(vl_id, {})[row['key']] = float(row['value'])
+        # Ne retourner que les VL avec x ET y définis
+        return {vl: (int(d['diagram_x']), int(d['diagram_y']))
+                for vl, d in pos.items()
+                if 'diagram_x' in d and 'diagram_y' in d}
+    except Exception:
+        return {}
+
+
+def write_diagram_positions(net: pn.Network, positions: dict):
+    """
+    Écrit les positions {vl_id: (x, y)} comme propriétés IIDM
+    sur les voltage levels correspondants.
+    Ces propriétés seront sauvegardées dans le .xiidm et relues au prochain chargement.
+    """
+    if not positions:
+        return
+    import pandas as pd
+    vl_ids = list(positions.keys())
+    df = pd.DataFrame({
+        'diagram_x': [str(positions[v][0]) for v in vl_ids],
+        'diagram_y': [str(positions[v][1]) for v in vl_ids],
+    }, index=pd.Index(vl_ids, name='id'))
+    try:
+        net.add_elements_properties(df)
+    except Exception:
+        pass
+
+
+def extract_topology_from_network(net: pn.Network) -> dict:
+    """
+    Reconstruit la topologie (NODES, LINES, GENERATORS, LOADS, SHUNTS)
+    depuis un réseau pypowsybl chargé depuis l'IIDM.
+
+    Retourne un dict avec les clés :
+      nodes, lines, generators, loads, shunts,
+      node_by_id, gen_by_id, load_by_id, sh_by_id
+    """
+    # ── Positions : priorité aux propriétés IIDM diagram_x/diagram_y
+    iidm_positions = read_diagram_positions(net)
+
+    vls = net.get_voltage_levels()[['substation_id','nominal_v']]
+    vl_list = list(vls.index)
+    n_vl = len(vl_list)
+
+    # Fallback : disposition en cercle si positions IIDM absentes ou incomplètes
+    import math as _math
+    cx, cy, radius = 410, 250, min(280, max(120, n_vl * 35))
+    circle_positions = {}
+    for i, vl_id in enumerate(vl_list):
+        angle = 2 * _math.pi * i / n_vl - _math.pi / 2
+        circle_positions[vl_id] = (
+            int(cx + radius * _math.cos(angle)),
+            int(cy + radius * _math.sin(angle))
+        )
+
+    def get_pos(vl_id):
+        """Retourne la position IIDM si disponible, sinon la position circulaire."""
+        if vl_id in iidm_positions:
+            return iidm_positions[vl_id]
+        return circle_positions.get(vl_id, (cx, cy))
+
+    # ── NODES : un nœud par voltage level
+    nodes = []
+    for vl_id in vl_list:
+        row = vls.loc[vl_id]
+        x, y = get_pos(vl_id)
+        from_iidm = vl_id in iidm_positions
+        nodes.append({
+            "id":   vl_id,
+            "name": f"{vl_id} ({row['nominal_v']:.0f} kV)",
+            "type": "pq",
+            "x":    x, "y": y,
+            "vl":   vl_id,
+            "bus":  vl_id + "_0",
+            "sub":  row['substation_id'],
+            "nominal_kv":   float(row['nominal_v']),
+            "pos_from_iidm": from_iidm,   # indique si la position vient de l'IIDM
+        })
+    node_by_vl = {n["vl"]: n["id"] for n in nodes}
+
+    # ── GENERATORS
+    generators = []
+    try:
+        gens_df = net.get_generators()[
+            ['name','energy_source','target_p','target_q','target_v',
+             'min_p','max_p','voltage_regulator_on','voltage_level_id','bus_id']]
+        for gid, row in gens_df.iterrows():
+            vl = row['voltage_level_id']
+            nid = node_by_vl.get(vl, vl)
+            es  = row['energy_source']
+            reg = bool(row['voltage_regulator_on'])
+            vl_nom = vls.loc[vl, 'nominal_v'] if vl in vls.index else BASE_KV
+            generators.append({
+                "id":            gid,
+                "node":          nid,
+                "name":          row.get('name', gid) or gid,
+                "type":          "synchronous" if reg else
+                                  ("wind"  if es=="WIND"  else
+                                   "solar" if es=="SOLAR" else "pq"),
+                "energy_source": es,
+                "P_mw":    float(row['target_p']),
+                "Q_mvar":  float(row['target_q']),
+                "V_pu":    float(row['target_v']) / vl_nom if vl_nom else 1.0,
+                "P_min":   float(row['min_p']),
+                "P_max":   float(row['max_p']),
+                "V_min":   0.95, "V_max": 1.05,
+                "Q_min":  -9999, "Q_max": 9999,
+            })
+            # Marquer le type du nœud
+            nd = next((n for n in nodes if n["id"]==nid), None)
+            if nd:
+                nd["type"] = "pv" if reg else "pq"
+    except Exception:
+        pass
+
+    # ── Identifier le nœud slack (premier générateur PV connecté)
+    for nd in nodes:
+        if nd["type"] == "pv":
+            nd["type"] = "slack"
+            break
+
+    # ── LOADS
+    loads = []
+    try:
+        loads_df = net.get_loads()[['name','p0','q0','voltage_level_id']]
+        for lid, row in loads_df.iterrows():
+            vl  = row['voltage_level_id']
+            nid = node_by_vl.get(vl, vl)
+            loads.append({
+                "id":    lid,
+                "node":  nid,
+                "name":  row.get('name', lid) or lid,
+                "P_mw":  float(row['p0']),
+                "Q_mvar":float(row['q0']),
+            })
+    except Exception:
+        pass
+
+    # ── SHUNTS
+    shunts = []
+    try:
+        sh_df = net.get_shunt_compensators()[
+            ['name','b','model_type','voltage_level_id']]
+        for sid, row in sh_df.iterrows():
+            vl  = row['voltage_level_id']
+            nid = node_by_vl.get(vl, vl)
+            vl_nom = vls.loc[vl, 'nominal_v'] if vl in vls.index else BASE_KV
+            z_base_local = vl_nom**2 / BASE_MVA
+            y_base_local = 1.0 / z_base_local if z_base_local else Y_BASE
+            B_pu = float(row['b']) / y_base_local if y_base_local else 0.0
+            styp = "capacitor" if B_pu >= 0 else "inductor"
+            shunts.append({
+                "id":    sid,
+                "node":  nid,
+                "name":  row.get('name', sid) or sid,
+                "type":  styp,
+                "B_pu":  B_pu,
+                "B_min": min(B_pu * 2, -0.5) if styp=="inductor" else 0.0,
+                "B_max": max(B_pu * 2,  0.5) if styp=="capacitor" else 0.0,
+            })
+    except Exception:
+        pass
+
+    # ── LINES
+    lines = []
+    try:
+        lines_df = net.get_lines()[
+            ['name','r','x','b1','b2','g1','g2',
+             'voltage_level1_id','voltage_level2_id']]
+        for lid, row in lines_df.iterrows():
+            vl1 = row['voltage_level1_id']
+            vl2 = row['voltage_level2_id']
+            nd1 = node_by_vl.get(vl1, vl1)
+            nd2 = node_by_vl.get(vl2, vl2)
+            # Chercher la tension nominale pour la base
+            vl_nom = vls.loc[vl1, 'nominal_v'] if vl1 in vls.index else BASE_KV
+            z_base_local = vl_nom**2 / BASE_MVA
+            y_base_local = 1.0/z_base_local if z_base_local else Y_BASE
+            R_pu  = float(row['r']) / z_base_local
+            X_pu  = float(row['x']) / z_base_local
+            Bc_pu = (float(row['b1']) + float(row['b2'])) / y_base_local
+            Gc_pu = (float(row['g1']) + float(row['g2'])) / y_base_local
+            lines.append({
+                "id":   lid,
+                "from": nd1,
+                "to":   nd2,
+                "name": row.get('name', lid) or lid,
+                "R_pu":    R_pu,
+                "X_pu":    X_pu,
+                "Bc_pu":   Bc_pu,
+                "Gc_pu":   Gc_pu,
+                "rating_mva": 100.0,   # valeur par défaut si absent de l'IIDM
+            })
+    except Exception:
+        pass
+
+    return {
+        "nodes":      nodes,
+        "lines":      lines,
+        "generators": generators,
+        "loads":      loads,
+        "shunts":     shunts,
+        "node_by_id": {n["id"]: n for n in nodes},
+        "gen_by_id":  {g["id"]: g for g in generators},
+        "load_by_id": {l["id"]: l for l in loads},
+        "sh_by_id":   {s["id"]: s for s in shunts},
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -325,9 +594,19 @@ class GridApp:
     def __init__(self, root, iidm_path=None):
         self.root        = root
         self.iidm_path   = iidm_path        # fichier courant (None = nouveau)
-        self.node_results = {}
-        self.line_results = {}
+        self.node_results       = {}
+        self.line_results       = {}
+        self.transformer_results= {}
         self.converged    = False
+
+        # Topologie courante — pointe sur les constantes globales par défaut,
+        # remplacée par _apply_topology() lors du chargement d'un IIDM externe
+        self._nodes      = NODES
+        self._lines      = LINES
+        self._generators = GENERATORS
+        self._loads      = LOADS
+        self._shunts     = SHUNTS
+        self._node_by_id = NODE_BY_ID
         self.lf_status    = ""
         self.gen_vars     = {}
         self.load_vars    = {}
@@ -337,6 +616,7 @@ class GridApp:
         self._zoom        = 1.0
         self._pan_x       = 0.0; self._pan_y = 0.0
         self._drag_start  = None
+        self._dragging_node = None   # nœud en cours de déplacement
         self._menu_win    = None
 
         # Ouvrages hors tension (disjoncteurs ouverts)
@@ -413,21 +693,23 @@ class GridApp:
         tk.Label(parent,text="SOURCES DE PRODUCTION",font=mono(9,True),
                  fg=BLUE,bg=PANEL).pack(pady=(8,2))
         inner = self._scrollable(parent)
+        self._prod_scroll_inner = inner   # référence pour _apply_topology
         self._sep(inner,"Machines Synchrones")
-        for g in GENERATORS:
+        for g in self._generators:
             if g["type"]=="synchronous": self._sync_widget(inner,g)
         self._sep(inner,"Sources Renouvelables")
-        for g in GENERATORS:
+        for g in self._generators:
             if g["type"] in ("wind","solar"): self._ren_widget(inner,g)
 
     def _build_conso_tab(self, parent):
         tk.Label(parent,text="CHARGES  &  COMPENSATION",font=mono(9,True),
                  fg=RED,bg=PANEL).pack(pady=(8,2))
         inner = self._scrollable(parent)
+        self._conso_scroll_inner = inner   # référence pour _apply_topology
         self._sep(inner,"Charges")
-        for l in LOADS: self._load_widget(inner,l)
+        for l in self._loads: self._load_widget(inner,l)
         self._sep(inner,"Elements Shunt (reglage tension)")
-        for sh in SHUNTS: self._shunt_widget(inner,sh)
+        for sh in self._shunts: self._shunt_widget(inner,sh)
 
     def _build_results_tab(self, parent):
         tk.Label(parent,text="RESULTATS — PyPowSybl OLF",font=mono(9,True),
@@ -450,8 +732,9 @@ class GridApp:
         self._sep(inner,"Tensions aux Noeuds")
         vf=tk.Frame(inner,bg=CARD,highlightbackground=BORDER,highlightthickness=1)
         vf.pack(fill='x',padx=8,pady=3)
+        self._vframe = vf   # référence pour _apply_topology
         self._vlbls={}
-        for nd in NODES:
+        for nd in self._nodes:
             fr=tk.Frame(vf,bg=CARD); fr.pack(fill='x',padx=6,pady=2)
             tk.Label(fr,text=f"{nd['id']} {nd['name'].split('-')[0].strip()}:",
                      font=mono(7),fg=T_SEC,bg=CARD,width=16,anchor='w').pack(side='left')
@@ -461,8 +744,9 @@ class GridApp:
         self._sep(inner,"Flux sur les Lignes")
         lf=tk.Frame(inner,bg=CARD,highlightbackground=BORDER,highlightthickness=1)
         lf.pack(fill='x',padx=8,pady=3)
+        self._lf_frame_widget = lf   # référence pour _apply_topology
         self._lflbls={}
-        for line in LINES:
+        for line in self._lines:
             fr=tk.Frame(lf,bg=CARD); fr.pack(fill='x',padx=6,pady=2)
             tk.Label(fr,text=f"{line['id']}:",font=mono(7),fg=T_SEC,bg=CARD,
                      width=7,anchor='w').pack(side='left')
@@ -527,9 +811,10 @@ class GridApp:
         self.canvas.bind('<Button-4>',   self._wheel_up)
         self.canvas.bind('<Button-5>',   self._wheel_down)
         self.canvas.bind('<MouseWheel>', self._wheel_win)
-        self.canvas.bind('<ButtonPress-1>',  self._drag_start_cb)
-        self.canvas.bind('<B1-Motion>',      self._drag_move)
-        self.canvas.bind('<ButtonRelease-1>',self._drag_end)
+        # Clic gauche : drag nœud si sur un nœud, sinon pan
+        self.canvas.bind('<ButtonPress-1>',   self._on_left_press)
+        self.canvas.bind('<B1-Motion>',       self._on_left_motion)
+        self.canvas.bind('<ButtonRelease-1>', self._on_left_release)
         # Clic droit → menu contextuel ouvrage
         self.canvas.bind('<Button-3>',       self._on_right_click)
 
@@ -537,9 +822,10 @@ class GridApp:
         leg=tk.Frame(parent,bg=PANEL,height=34,
                      highlightbackground=BORDER,highlightthickness=1)
         leg.pack(fill='x',pady=(4,0)); leg.pack_propagate(False)
-        for txt,col in [("[SM]Slack",BLUE),("[SM]PV",GREEN),("[Eo]Eolien",PURPLE),
-                         ("[PV]Sol",AMBER),("[Ch]Charge",RED),("[C]Capa",CYAN),
-                         ("[L]Ind",PINK),("Pi:Bc/2",CYAN),("R/X",ORANGE),("P/Q",BLUE),
+        for txt,col in [("[SM-PV] NUCLEAR slack",BLUE),("[SM-PV] NUCLEAR",GREEN),
+                         ("[Eo-PQ] WIND",PURPLE),("[PV-PQ] SOLAR",AMBER),
+                         ("[Ch] Charge",RED),("[C]Capa",CYAN),("[L]Ind",PINK),
+                         ("PV=reg.V",GREEN),("PQ=P+Q",TEAL),
                          ("H.T.=clic droit",RED)]:
             tk.Label(leg,text=txt,font=mono(7),fg=col,bg=PANEL
                      ).pack(side='left',padx=5,pady=7)
@@ -714,7 +1000,7 @@ class GridApp:
 
     def _get_gen_sp(self):
         sp={}
-        for g in GENERATORS:
+        for g in self._generators:
             gid=g["id"]; sp[gid]={}
             if gid in self.gen_vars:
                 if 'P' in self.gen_vars[gid]: sp[gid]["P_mw"]=self.gen_vars[gid]['P'].get()
@@ -724,7 +1010,7 @@ class GridApp:
 
     def _get_load_sp(self):
         sp={}
-        for l in LOADS:
+        for l in self._loads:
             lid=l["id"]; sp[lid]={}
             if lid in self.load_vars:
                 if 'P' in self.load_vars[lid]: sp[lid]["P_mw"]=self.load_vars[lid]['P'].get()
@@ -733,7 +1019,7 @@ class GridApp:
 
     def _get_shunt_sp(self):
         sp={}
-        for sh in SHUNTS:
+        for sh in self._shunts:
             sid=sh["id"]
             sp[sid]=(self.shunt_vars[sid]['B'].get()
                      if sid in self.shunt_vars and 'B' in self.shunt_vars[sid]
@@ -748,8 +1034,8 @@ class GridApp:
             net = build_network(gen_sp, load_sp, shunt_sp,
                                 open_lines=self._open_lines,
                                 open_nodes=self._open_nodes)
-            self.node_results, self.line_results, self.converged, iters, status = \
-                run_loadflow(net)
+            self.node_results, self.line_results, self.transformer_results, \
+                self.converged, iters, status = run_loadflow(net)
             # Conserver le réseau pour l'export IIDM (avec résultats)
             self._last_net = net
 
@@ -771,7 +1057,7 @@ class GridApp:
     def _update_results(self, gen_sp, load_sp, shunt_sp):
         # Résultats générateurs
         P_gen=0.0; Q_gen=0.0
-        for g in GENERATORS:
+        for g in self._generators:
             gid=g["id"]; nid=g["node"]
             if gid in self.gen_vars and 'rlbl' in self.gen_vars[gid]:
                 P=self.node_results.get(nid,{}).get("P_gen_mw",  gen_sp.get(gid,{}).get("P_mw", g["P_mw"]))
@@ -782,7 +1068,7 @@ class GridApp:
 
         # Résultats shunts
         Q_sh_tot=0.0
-        for sh in SHUNTS:
+        for sh in self._shunts:
             sid=sh["id"]; nid=sh["node"]
             B=shunt_sp.get(sid, sh["B_pu"])
             V=self.node_results.get(nid,{}).get("V_pu",1.0)
@@ -792,8 +1078,8 @@ class GridApp:
                     text=f"Q shunt: {Qs:+.2f} Mvar",
                     fg=CYAN if Qs>=0 else PINK)
 
-        P_load=sum(load_sp.get(l["id"],{}).get("P_mw", l["P_mw"]) for l in LOADS)
-        Q_load=sum(load_sp.get(l["id"],{}).get("Q_mvar",l["Q_mvar"]) for l in LOADS)
+        P_load=sum(load_sp.get(l["id"],{}).get("P_mw", l["P_mw"]) for l in self._loads)
+        Q_load=sum(load_sp.get(l["id"],{}).get("Q_mvar",l["Q_mvar"]) for l in self._loads)
         P_loss=sum(f.get("P_loss",0) for f in self.line_results.values())
 
         self._blbls['P_gen'].config( text=f"{P_gen:.1f} MW",  fg=GREEN)
@@ -830,40 +1116,150 @@ class GridApp:
             title="Sauvegarder le réseau IIDM")
         if not path: return
         try:
+            # Écrire les positions canvas actuelles dans le réseau
+            # (coordonnées dans l'espace de design 820×500)
+            positions = {nd["vl"]: (nd["x"], nd["y"])
+                         for nd in self._nodes if "vl" in nd}
+            write_diagram_positions(self._last_net, positions)
             save_iidm(self._last_net, path)
-            self.iidm_path=path
-            messagebox.showinfo("Sauvegardé",f"Réseau sauvegardé :\n{path}")
+            self.iidm_path = path
+            n_pos = len(positions)
+            messagebox.showinfo("Sauvegardé",
+                f"Réseau sauvegardé :\n{path}\n\n"
+                f"{n_pos} positions de nœuds incluses (propriétés diagram_x/diagram_y).")
         except Exception as e:
-            messagebox.showerror("Erreur",str(e))
+            messagebox.showerror("Erreur", str(e))
 
     def _open_iidm(self):
-        path=filedialog.askopenfilename(
+        path = filedialog.askopenfilename(
             filetypes=[("IIDM réseau","*.xiidm *.iidm"),("Tous","*.*")],
             title="Ouvrir un fichier IIDM")
-        if not path: return
+        if not path:
+            return
         try:
-            net=load_iidm(path)
-            self._last_net=net
-            self.iidm_path=path
-            # Relancer le load flow sur le réseau chargé
-            params=plf.Parameters(distributed_slack=False,
-                voltage_init_mode=plf.VoltageInitMode.DC_VALUES)
-            res=plf.run_ac(net,parameters=params)
-            self.converged=(res[0].status==plf.ComponentStatus.CONVERGED)
-            iters=res[0].iteration_count
-            # Lire les résultats (sans mise à jour des curseurs)
-            self.node_results, self.line_results, self.converged, iters, _ = \
-                run_loadflow(net)
+            net = load_iidm(path)
+            self._last_net  = net
+            self.iidm_path  = path
+
+            # ── 1. Extraire la topologie depuis le réseau IIDM
+            topo = extract_topology_from_network(net)
+            self._apply_topology(topo)
+
+            # ── 2. Load flow
+            self.node_results, self.line_results, self.transformer_results, \
+                self.converged, iters, status = run_loadflow(net)
+
+            msg = "convergé" if self.converged else "non convergé"
             self.status_lbl.config(
-                text=f"  IIDM charge — LF {'OK' if self.converged else 'WARN'}",
+                text=f"  IIDM chargé — LF {msg} ({iters} iter)",
                 fg=GREEN if self.converged else AMBER)
+            if hasattr(self, '_conv_lbl'):
+                self._conv_lbl.config(
+                    text=f"{'OK' if self.converged else 'WARN'}  {status}  {iters} iter",
+                    fg=GREEN if self.converged else AMBER)
+
+            # ── 3. Redessiner avec la nouvelle topologie
+            self._open_lines = set()
+            self._open_nodes = set()
             self.draw_network()
+
             messagebox.showinfo("IIDM chargé",
                 f"Fichier : {os.path.basename(path)}\n"
-                f"Load flow : {'convergé' if self.converged else 'non convergé'} "
-                f"en {iters} iter.")
+                f"Noeuds : {len(self._nodes)}  "
+                f"Lignes : {len(self._lines)}  "
+                f"Transfo : {len(self.transformer_results)}\n"
+                f"Load flow : {msg} en {iters} iter.")
         except Exception as e:
-            messagebox.showerror("Erreur ouverture IIDM",str(e))
+            import traceback
+            messagebox.showerror("Erreur ouverture IIDM",
+                                 f"{e}\n\n{traceback.format_exc()[-400:]}")
+
+    def _apply_topology(self, topo: dict):
+        """
+        Remplace la topologie courante par celle extraite d'un fichier IIDM.
+        Met à jour : les données internes, l'onglet Résultats ET les onglets
+        Production / Conso & Comp (curseurs générateurs, charges, shunts).
+        """
+        self._nodes      = topo["nodes"]
+        self._lines      = topo["lines"]
+        self._generators = topo["generators"]
+        self._loads      = topo["loads"]
+        self._shunts     = topo["shunts"]
+        self._node_by_id = topo["node_by_id"]
+
+        # Réinitialiser les variables de curseurs (elles ne correspondent plus)
+        self.gen_vars   = {}
+        self.load_vars  = {}
+        self.shunt_vars = {}
+
+        # ── Onglet 1 : Production ─────────────────────────────────────────
+        if hasattr(self, '_prod_scroll_inner'):
+            for w in self._prod_scroll_inner.winfo_children():
+                w.destroy()
+            self._sep(self._prod_scroll_inner, "Machines Synchrones")
+            for g in self._generators:
+                if g["type"] == "synchronous":
+                    self._sync_widget(self._prod_scroll_inner, g)
+            self._sep(self._prod_scroll_inner, "Sources Renouvelables")
+            for g in self._generators:
+                if g["type"] in ("wind","solar"):
+                    self._ren_widget(self._prod_scroll_inner, g)
+            # Si pas de groupes connus, afficher tous les générateurs
+            if not any(g["type"] in ("synchronous","wind","solar")
+                       for g in self._generators):
+                self._sep(self._prod_scroll_inner, "Générateurs")
+                for g in self._generators:
+                    self._ren_widget(self._prod_scroll_inner, g)
+
+        # ── Onglet 2 : Conso & Comp ───────────────────────────────────────
+        if hasattr(self, '_conso_scroll_inner'):
+            for w in self._conso_scroll_inner.winfo_children():
+                w.destroy()
+            self._sep(self._conso_scroll_inner, "Charges")
+            for l in self._loads:
+                self._load_widget(self._conso_scroll_inner, l)
+            self._sep(self._conso_scroll_inner, "Elements Shunt (reglage tension)")
+            for sh in self._shunts:
+                self._shunt_widget(self._conso_scroll_inner, sh)
+
+        # ── Onglet 3 : Résultats — tensions ──────────────────────────────
+        if hasattr(self, '_vframe'):
+            for w in self._vframe.winfo_children():
+                w.destroy()
+            self._vlbls = {}
+            for nd in self._nodes:
+                fr = tk.Frame(self._vframe, bg=CARD)
+                fr.pack(fill='x', padx=6, pady=2)
+                tk.Label(fr, text=f"{nd['id']} ({nd.get('nominal_kv',0):.0f}kV):",
+                         font=mono(7), fg=T_SEC, bg=CARD,
+                         width=18, anchor='w').pack(side='left')
+                v = tk.Label(fr, text="--", font=mono(7,True), fg=T_PRI, bg=CARD)
+                v.pack(side='right', padx=2)
+                self._vlbls[nd["id"]] = v
+
+        # ── Onglet 3 : Résultats — flux lignes ────────────────────────────
+        if hasattr(self, '_lf_frame_widget'):
+            for w in self._lf_frame_widget.winfo_children():
+                w.destroy()
+            self._lflbls = {}
+            for line in self._lines:
+                fr = tk.Frame(self._lf_frame_widget, bg=CARD)
+                fr.pack(fill='x', padx=6, pady=2)
+                tk.Label(fr, text=f"{line['id']}:",
+                         font=mono(7), fg=T_SEC, bg=CARD,
+                         width=10, anchor='w').pack(side='left')
+                v = tk.Label(fr, text="--", font=mono(7,True), fg=T_PRI, bg=CARD)
+                v.pack(side='right', padx=2)
+                self._lflbls[line["id"]] = v
+            for tid in self.transformer_results:
+                fr = tk.Frame(self._lf_frame_widget, bg=CARD)
+                fr.pack(fill='x', padx=6, pady=2)
+                tk.Label(fr, text=f"[TR]{tid}:",
+                         font=mono(7), fg="#e0a020", bg=CARD,
+                         width=10, anchor='w').pack(side='left')
+                v = tk.Label(fr, text="--", font=mono(7,True), fg=T_PRI, bg=CARD)
+                v.pack(side='right', padx=2)
+                self._lflbls[tid] = v
 
     def _export_json(self):
         """Exporte les résultats courants en JSON pour post-traitement."""
@@ -888,98 +1284,139 @@ class GridApp:
     # ══════════════════════════════════════════════════════════
 
     def _on_right_click(self, event):
-        """Détecte l'ouvrage cliqué et affiche un menu contextuel."""
+        """Détecte l'ouvrage cliqué (nœud, ligne, transformateur) et affiche un menu contextuel."""
         tx, ty, scale = self._transform()
-        nd_pos = {nd["id"]: (tx(nd["x"]), ty(nd["y"])) for nd in NODES}
+        nd_pos = {nd["id"]: (tx(nd["x"]), ty(nd["y"])) for nd in self._nodes}
         r = max(20, min(40, int(scale * 20)))
+        spacing = max(12, 16*scale)
 
-        hit_node = None
-        hit_line = None
+        # Pré-calculer les groupes parallèles pour avoir les offsets corrects
+        rank_index, _ = self._build_parallel_groups(nd_pos)
 
-        # Test sur les nœuds (cercle de rayon r+8)
-        for nd in NODES:
+        hit_node      = None
+        hit_line      = None
+        hit_transfo   = None
+
+        # Test sur les nœuds
+        for nd in self._nodes:
             nx, ny = nd_pos[nd["id"]]
             if math.hypot(event.x - nx, event.y - ny) <= r + 8:
                 hit_node = nd["id"]
                 break
 
-        # Test sur les lignes (distance point-segment < seuil)
+        # Test sur les lignes (avec offset parallèle)
         if hit_node is None:
-            for line in LINES:
-                x1, y1 = nd_pos[line["from"]]
-                x2, y2 = nd_pos[line["to"]]
-                d = self._dist_point_segment(event.x, event.y, x1, y1, x2, y2)
-                if d < 10:
+            for line in self._lines:
+                x1,y1 = nd_pos[line["from"]]; x2,y2 = nd_pos[line["to"]]
+                n_tot, rank = rank_index.get(line["id"], (1,0))
+                dx,dy = self._perp_offset(x1,y1,x2,y2, rank, n_tot, spacing)
+                d = self._dist_point_segment(event.x, event.y,
+                                             x1+dx, y1+dy, x2+dx, y2+dy)
+                if d < 12:
                     hit_line = line["id"]
                     break
 
+        # Test sur les transformateurs (avec offset parallèle)
         if hit_node is None and hit_line is None:
-            return  # rien cliqué
+            for tid, tr in self.transformer_results.items():
+                nd1 = next((n["id"] for n in self._nodes if n["vl"]==tr["vl1"]), None)
+                nd2 = next((n["id"] for n in self._nodes if n["vl"]==tr["vl2"]), None)
+                if not nd1 or not nd2 or nd1 not in nd_pos or nd2 not in nd_pos:
+                    continue
+                x1,y1 = nd_pos[nd1]; x2,y2 = nd_pos[nd2]
+                n_tot, rank = rank_index.get(tid, (1,0))
+                dx,dy = self._perp_offset(x1,y1,x2,y2, rank, n_tot, spacing)
+                d = self._dist_point_segment(event.x, event.y,
+                                             x1+dx, y1+dy, x2+dx, y2+dy)
+                if d < 12:
+                    hit_transfo = tid
+                    break
 
-        # Construction du menu contextuel
+        if hit_node is None and hit_line is None and hit_transfo is None:
+            return
+
         menu = tk.Menu(self.root, tearoff=0,
                        bg=CARD, fg=T_PRI,
                        activebackground=BORDER, activeforeground=T_PRI,
                        font=mono(8), bd=0, relief='flat')
 
         if hit_node:
-            nd   = next(n for n in NODES if n["id"] == hit_node)
+            nd    = next(n for n in self._nodes if n["id"]==hit_node)
             open_ = hit_node in self._open_nodes
-            label = f"Noeud {hit_node} — {nd['name'].split('-')[-1].strip()}"
-            menu.add_command(label=label, state='disabled',
-                             font=mono(8, True))
+            menu.add_command(label=f"Noeud {hit_node} — {nd['name'].split('-')[-1].strip()}",
+                             state='disabled', font=mono(8,True))
             menu.add_separator()
             if open_:
-                menu.add_command(
-                    label="  ⚡  Remettre sous tension",
-                    foreground=GREEN,
-                    command=lambda n=hit_node: self._toggle_node(n))
+                menu.add_command(label="  Remettre sous tension", foreground=GREEN,
+                                 command=lambda n=hit_node: self._toggle_node(n))
             else:
-                menu.add_command(
-                    label="  ✕  Mettre hors tension (ouvrir DJ)",
-                    foreground=RED,
-                    command=lambda n=hit_node: self._toggle_node(n))
-            # Lister les lignes connectées
-            connected = [l for l in LINES
-                         if l["from"] == hit_node or l["to"] == hit_node]
-            if connected:
+                menu.add_command(label="  Mettre hors tension (ouvrir DJ)", foreground=RED,
+                                 command=lambda n=hit_node: self._toggle_node(n))
+            connected = [l for l in self._lines if l["from"]==hit_node or l["to"]==hit_node]
+            connected_tr = [(tid,tr) for tid,tr in self.transformer_results.items()
+                            if (next((n["id"] for n in self._nodes if n["vl"]==tr["vl1"]),None)==hit_node
+                             or next((n["id"] for n in self._nodes if n["vl"]==tr["vl2"]),None)==hit_node)]
+            if connected or connected_tr:
                 menu.add_separator()
-                menu.add_command(label="  Lignes connectées :", state='disabled')
+                menu.add_command(label="  Ouvrages connectes :", state='disabled')
                 for l in connected:
-                    open_l = l["id"] in self._open_lines
-                    status = "  [OUVERTE]" if open_l else ""
+                    st = "  [H.T.]" if l["id"] in self._open_lines else ""
                     menu.add_command(
-                        label=f"    {l['id']} — {l['name']}{status}",
-                        foreground=T_SEC if open_l else T_PRI,
+                        label=f"    {l['id']} — {l['name']}{st}",
+                        foreground=T_SEC if st else T_PRI,
                         command=lambda lid=l["id"]: self._toggle_line(lid))
+                for tid, tr in connected_tr:
+                    st = "  [H.T.]" if tid in self._open_lines else ""
+                    menu.add_command(
+                        label=f"    [TR] {tid}  {tr.get('rated_u1',0):.0f}/{tr.get('rated_u2',0):.0f}kV{st}",
+                        foreground=T_SEC if st else "#e0a020",
+                        command=lambda t=tid: self._toggle_line(t))
 
         elif hit_line:
-            line  = next(l for l in LINES if l["id"] == hit_line)
+            line  = next(l for l in self._lines if l["id"]==hit_line)
             open_ = hit_line in self._open_lines
             menu.add_command(label=f"Ligne {hit_line} — {line['name']}",
-                             state='disabled', font=mono(8, True))
+                             state='disabled', font=mono(8,True))
             menu.add_separator()
             lf = self.line_results.get(hit_line, {})
             if lf:
-                P = lf.get("P_from", 0); Q = lf.get("Q_from", 0)
-                load_pct = lf.get("loading_pct", 0)
-                menu.add_command(
-                    label=f"  P={P:+.1f} MW  Q={Q:+.1f} Mvar  ({load_pct:.0f}%)",
-                    state='disabled')
-                menu.add_command(
-                    label=f"  R={line['R_pu']:.4f} pu   X={line['X_pu']:.4f} pu",
-                    state='disabled')
-                menu.add_separator()
+                P=lf.get("P_from",0); Q=lf.get("Q_from",0); lp=lf.get("loading_pct",0)
+                menu.add_command(label=f"  P={P:+.1f} MW  Q={Q:+.1f} Mvar  ({lp:.0f}%)",
+                                 state='disabled')
+                menu.add_command(label=f"  Pertes : {lf.get('P_loss',0):.3f} MW",
+                                 state='disabled')
+            menu.add_separator()
             if open_:
-                menu.add_command(
-                    label="  ⚡  Réenclencher la ligne",
-                    foreground=GREEN,
-                    command=lambda lid=hit_line: self._toggle_line(lid))
+                menu.add_command(label="  Reenclencher", foreground=GREEN,
+                                 command=lambda lid=hit_line: self._toggle_line(lid))
             else:
-                menu.add_command(
-                    label="  ✕  Ouvrir les disjoncteurs (H.T.)",
-                    foreground=RED,
-                    command=lambda lid=hit_line: self._toggle_line(lid))
+                menu.add_command(label="  Ouvrir les disjoncteurs (H.T.)", foreground=RED,
+                                 command=lambda lid=hit_line: self._toggle_line(lid))
+
+        elif hit_transfo:
+            tr    = self.transformer_results[hit_transfo]
+            open_ = hit_transfo in self._open_lines
+            u1    = tr.get("rated_u1",0); u2 = tr.get("rated_u2",0)
+            menu.add_command(
+                label=f"Transformateur {hit_transfo}  {u1:.0f}/{u2:.0f} kV",
+                state='disabled', font=mono(8,True))
+            menu.add_separator()
+            P=tr.get("P_from",0); Q=tr.get("Q_from",0); lp=tr.get("loading_pct",0)
+            if P==P:   # not NaN
+                menu.add_command(label=f"  P={P:+.1f} MW  Q={Q:+.1f} Mvar  ({lp:.0f}%)",
+                                 state='disabled')
+                menu.add_command(label=f"  Pertes : {tr.get('P_loss',0):.3f} MW",
+                                 state='disabled')
+            X_pu = tr.get("X_pu",0)
+            z_base = (u1**2/BASE_MVA) if u1 else Z_BASE
+            menu.add_command(label=f"  X = {X_pu/z_base:.4f} pu", state='disabled')
+            menu.add_separator()
+            if open_:
+                menu.add_command(label="  Reenclencher le transformateur", foreground=GREEN,
+                                 command=lambda t=hit_transfo: self._toggle_line(t))
+            else:
+                menu.add_command(label="  Ouvrir le transformateur (H.T.)", foreground=RED,
+                                 command=lambda t=hit_transfo: self._toggle_line(t))
 
         menu.add_separator()
         menu.add_command(label="  Remettre tout sous tension",
@@ -1013,13 +1450,13 @@ class GridApp:
         if node_id in self._open_nodes:
             self._open_nodes.discard(node_id)
             # Réenclencher les lignes qui étaient ouvertes à cause de ce nœud
-            for line in LINES:
+            for line in self._lines:
                 if (line["from"] == node_id or line["to"] == node_id):
                     self._open_lines.discard(line["id"])
         else:
             self._open_nodes.add(node_id)
             # Ouvrir toutes les lignes connectées
-            for line in LINES:
+            for line in self._lines:
                 if line["from"] == node_id or line["to"] == node_id:
                     self._open_lines.add(line["id"])
         self._schedule()
@@ -1057,15 +1494,63 @@ class GridApp:
     def _wheel_win(self,e):
         if e.delta>0: self.zoom_in(e.x,e.y)
         else:         self.zoom_out(e.x,e.y)
-    def _drag_start_cb(self,e):
-        self._drag_start=(e.x,e.y); self.canvas.config(cursor='hand2')
-    def _drag_move(self,e):
-        if not self._drag_start: return
-        dx=e.x-self._drag_start[0]; dy=e.y-self._drag_start[1]
-        self._pan_x+=dx; self._pan_y+=dy
-        self._drag_start=(e.x,e.y); self.draw_network()
-    def _drag_end(self,e):
-        self._drag_start=None; self.canvas.config(cursor='fleur')
+    # ── Clic gauche : drag nœud ou pan ───────────────────────
+
+    def _hit_node(self, ex, ey):
+        """Retourne l'id du nœud sous le curseur (x,y) canvas, ou None."""
+        tx, ty, scale = self._transform()
+        r = max(20, min(40, int(scale * 20))) + 8
+        for nd in self._nodes:
+            nx, ny = tx(nd["x"]), ty(nd["y"])
+            if math.hypot(ex - nx, ey - ny) <= r:
+                return nd["id"]
+        return None
+
+    def _canvas_to_design(self, cx, cy):
+        """Convertit des coordonnées canvas en coordonnées espace design (820×500)."""
+        _, _, scale = self._transform()
+        W = self.canvas.winfo_width(); H = self.canvas.winfo_height()
+        margin = 60
+        x = (cx - margin - self._pan_x) / scale
+        y = (cy - margin - self._pan_y) / scale
+        return x, y
+
+    def _on_left_press(self, e):
+        nid = self._hit_node(e.x, e.y)
+        if nid:
+            # Drag nœud
+            self._dragging_node = nid
+            self._drag_start    = None
+            self.canvas.config(cursor='fleur')
+        else:
+            # Pan
+            self._dragging_node = None
+            self._drag_start    = (e.x, e.y)
+            self.canvas.config(cursor='hand2')
+
+    def _on_left_motion(self, e):
+        if self._dragging_node:
+            # Déplacer le nœud dans l'espace design
+            dx, dy = self._canvas_to_design(e.x, e.y)
+            # Clamp dans l'espace de design
+            dx = max(20, min(self.DW - 20, dx))
+            dy = max(20, min(self.DH - 20, dy))
+            nd = next((n for n in self._nodes if n["id"] == self._dragging_node), None)
+            if nd:
+                nd["x"] = int(dx)
+                nd["y"] = int(dy)
+                self.draw_network()
+        elif self._drag_start:
+            ddx = e.x - self._drag_start[0]
+            ddy = e.y - self._drag_start[1]
+            self._pan_x += ddx; self._pan_y += ddy
+            self._drag_start = (e.x, e.y)
+            self.draw_network()
+
+    def _on_left_release(self, e):
+        self._dragging_node = None
+        self._drag_start    = None
+        self.canvas.config(cursor='fleur')
 
     # ══════════════════════════════════════════════════════════
     #  DESSIN DU RÉSEAU
@@ -1079,6 +1564,66 @@ class GridApp:
         def ty(y): return margin+y*s+self._pan_y
         return tx,ty,s
 
+    @staticmethod
+    def _perp_offset(x1,y1,x2,y2,rank,n_total,spacing=16):
+        """
+        Décalage perpendiculaire centré pour l'ouvrage de rang `rank`
+        dans un groupe de `n_total` ouvrages parallèles.
+        Retourne (dx, dy).
+        """
+        length = math.hypot(x2-x1, y2-y1)
+        if length < 1e-6 or n_total <= 1:
+            return 0.0, 0.0
+        nx = -(y2-y1)/length
+        ny =  (x2-x1)/length
+        offset = (rank - (n_total-1)/2.0) * spacing
+        return nx*offset, ny*offset
+
+    def _build_parallel_groups(self, nd_pos):
+        """
+        Construit un index {equipment_id: (n_total, rank)} pour toutes
+        les lignes et transformateurs, en regroupant ceux qui relient
+        les mêmes deux nœuds canvas (position identique → même paire).
+        Retourne aussi {equipment_id: (x1,y1,x2,y2)} pour le hit-test clic droit.
+        """
+        from collections import defaultdict
+
+        # Regrouper lignes + transformateurs par paire de positions (arrondie)
+        pair_to_equip = defaultdict(list)
+
+        # Lignes statiques (self._lines)
+        for line in self._lines:
+            x1,y1 = nd_pos[line["from"]]
+            x2,y2 = nd_pos[line["to"]]
+            # Clé normalisée (nœud le plus petit en premier)
+            key = tuple(sorted([line["from"], line["to"]]))
+            pair_to_equip[key].append(("line", line["id"], x1,y1,x2,y2))
+
+        # Transformateurs lus depuis IIDM
+        for tid, tr in self.transformer_results.items():
+            # Retrouver les nœuds par voltage_level_id
+            nd1 = next((nd["id"] for nd in self._nodes if nd["vl"]==tr["vl1"]), None)
+            nd2 = next((nd["id"] for nd in self._nodes if nd["vl"]==tr["vl2"]), None)
+            if nd1 and nd2 and nd1 in nd_pos and nd2 in nd_pos:
+                x1,y1 = nd_pos[nd1]; x2,y2 = nd_pos[nd2]
+                key = tuple(sorted([nd1, nd2]))
+                pair_to_equip[key].append(("transformer", tid, x1,y1,x2,y2))
+            elif nd1 and nd2:
+                # nœuds pas dans self._nodes — cas réseau IIDM externe : placer en (0,0) temporaire
+                pair_to_equip[("_ext",tid)].append(("transformer",tid,0,0,0,0))
+
+        # Construire index rank + positions avec offset
+        rank_index  = {}   # equip_id → (n_total, rank)
+        coord_index = {}   # equip_id → (x1,y1,x2,y2)  avant offset
+
+        for key, items in pair_to_equip.items():
+            n_total = len(items)
+            for rank, (etype, eid, x1,y1,x2,y2) in enumerate(items):
+                rank_index[eid]  = (n_total, rank)
+                coord_index[eid] = (x1,y1,x2,y2)
+
+        return rank_index, coord_index
+
     def draw_network(self):
         c=self.canvas; c.delete('all')
         W=c.winfo_width(); H=c.winfo_height()
@@ -1087,37 +1632,83 @@ class GridApp:
         c.create_text(W-6,H-8,text=f"zoom {self._zoom*100:.0f}%",
                       font=mono(7),fill=T_SEC,anchor='se')
 
+        # Positions canvas de chaque nœud
+        nd_pos={nd["id"]:(tx(nd["x"]),ty(nd["y"])) for nd in self._nodes}
+
+        # ── Calcul des groupes parallèles (lignes + transformateurs)
+        rank_index, coord_index = self._build_parallel_groups(nd_pos)
+        spacing = max(12, 16*scale)   # espacement adaptatif au zoom
+
         # ── Lignes
-        nd_pos={nd["id"]:(tx(nd["x"]),ty(nd["y"])) for nd in NODES}
-        for line in LINES:
-            x1,y1=nd_pos[line["from"]]; x2,y2=nd_pos[line["to"]]
+        for line in self._lines:
+            x1,y1 = nd_pos[line["from"]]; x2,y2 = nd_pos[line["to"]]
+            n_tot, rank = rank_index.get(line["id"], (1,0))
+            dx, dy = self._perp_offset(x1,y1,x2,y2, rank, n_tot, spacing)
+            ox1,oy1 = x1+dx, y1+dy
+            ox2,oy2 = x2+dx, y2+dy
+
             is_open = line["id"] in self._open_lines
             if is_open:
-                # Ligne ouverte : tirets gris + symbole disjoncteur
-                self._draw_open_line(c, x1, y1, x2, y2, line)
+                self._draw_open_line(c, ox1,oy1,ox2,oy2, line)
             else:
-                lf=self.line_results.get(line["id"],{})
-                loading=lf.get("loading_pct",0)
-                lcol=RED if loading>90 else AMBER if loading>70 else "#2a3a5c"
-                lw=3.5 if loading>90 else 2.5 if loading>70 else 2
-                self._draw_pi_line(c,x1,y1,x2,y2,line,lf,lcol,lw,scale)
+                lf = self.line_results.get(line["id"],{})
+                loading = lf.get("loading_pct",0)
+                lcol = RED if loading>90 else AMBER if loading>70 else "#2a3a5c"
+                lw   = 3.5 if loading>90 else 2.5 if loading>70 else 2
+                self._draw_pi_line(c, ox1,oy1,ox2,oy2, line, lf, lcol, lw, scale,
+                                   n_tot=n_tot, rank=rank)
+
+        # ── Transformateurs (lus depuis l'IIDM)
+        for tid, tr in self.transformer_results.items():
+            nd1 = next((nd["id"] for nd in self._nodes if nd["vl"]==tr["vl1"]), None)
+            nd2 = next((nd["id"] for nd in self._nodes if nd["vl"]==tr["vl2"]), None)
+            if not nd1 or not nd2 or nd1 not in nd_pos or nd2 not in nd_pos:
+                continue
+            x1,y1 = nd_pos[nd1]; x2,y2 = nd_pos[nd2]
+            n_tot, rank = rank_index.get(tid, (1,0))
+            dx, dy = self._perp_offset(x1,y1,x2,y2, rank, n_tot, spacing)
+            ox1,oy1 = x1+dx, y1+dy
+            ox2,oy2 = x2+dx, y2+dy
+
+            is_open = tid in self._open_lines
+            self._draw_transformer(c, ox1,oy1,ox2,oy2, tid, tr, scale, is_open)
 
         # ── Shunts
         sh_by_node={}
-        for sh in SHUNTS: sh_by_node.setdefault(sh["node"],[]).append(sh)
+        for sh in self._shunts: sh_by_node.setdefault(sh["node"],[]).append(sh)
 
         # ── Nœuds
         r=max(20,min(40,int(scale*20)))
-        for nd in NODES:
+        for nd in self._nodes:
             nx,ny=nd_pos[nd["id"]]; nid=nd["id"]
-            gn=next((g for g in GENERATORS if g["node"]==nid),None)
-            ln=next((l for l in LOADS       if l["node"]==nid),None)
-            if gn and gn["type"]=="synchronous":
-                col=BLUE if nid=="N1" else GREEN; sym="[SM]"
-            elif gn and gn["type"]=="wind":  col=PURPLE; sym="[Eo]"
-            elif gn and gn["type"]=="solar": col=AMBER;  sym="[PV]"
-            elif ln:                         col=RED;    sym="[Ch]"
-            else:                            col=T_SEC;  sym="[?]"
+            gn=next((g for g in self._generators if g["node"]==nid),None)
+            ln=next((l for l in self._loads       if l["node"]==nid),None)
+
+            es    = self.node_results.get(nid,{}).get("energy_source",None)
+            is_pv = self.node_results.get(nid,{}).get("is_pv",None)
+
+            if es == "NUCLEAR":
+                col = BLUE if (is_pv and nid=="N1") else GREEN
+                sym = "[SM-PV]"; ctrl = "PV"
+            elif es == "WIND":
+                col=PURPLE; sym="[Eo-PQ]"; ctrl="PQ"
+            elif es == "SOLAR":
+                col=AMBER;  sym="[PV-PQ]"; ctrl="PQ"
+            elif es == "HYDRO":
+                col=CYAN;   sym="[HY-PV]"; ctrl="PV"
+            elif es == "THERMAL":
+                col=ORANGE; sym="[TH-PV]"; ctrl="PV"
+            elif gn:
+                if gn["type"]=="synchronous":
+                    col=BLUE if nid=="N1" else GREEN; sym="[SM]"; ctrl="PV"
+                elif gn["type"]=="wind":
+                    col=PURPLE; sym="[Eo]"; ctrl="PQ"
+                else:
+                    col=AMBER; sym="[PV]"; ctrl="PQ"
+            elif ln:
+                col=RED; sym="[Ch]"; ctrl=""
+            else:
+                col=T_SEC; sym="[?]"; ctrl=""
 
             if self._show['shunts'].get() and nid in sh_by_node:
                 self._draw_shunts(c,nx,ny,r,sh_by_node[nid])
@@ -1130,16 +1721,17 @@ class GridApp:
             c.create_oval(nx-r,ny-r,nx+r,ny+r,
                           fill=CARD if not is_open_node else "#1a1a1a",
                           outline=node_col,width=2.5)
-            c.create_text(nx,ny-8,text=sym,font=mono(8,True),fill=node_col)
-            c.create_text(nx,ny+9,text=nid,font=mono(8,True),
+            c.create_text(nx,ny-9,text=sym,font=mono(7,True),fill=node_col)
+            c.create_text(nx,ny+4,text=nid,font=mono(8,True),
                           fill=T_PRI if not is_open_node else T_SEC)
-            # Croix rouge "hors tension"
+            if ctrl:
+                ctrl_col=GREEN if ctrl=="PV" else TEAL
+                c.create_text(nx,ny+16,text=ctrl,font=mono(6,True),fill=ctrl_col)
             if is_open_node:
                 d=r*0.55
                 c.create_line(nx-d,ny-d,nx+d,ny+d,fill=RED,width=3)
                 c.create_line(nx+d,ny-d,nx-d,ny+d,fill=RED,width=3)
-                c.create_text(nx,ny-r-14,text="H.T.",
-                              font=mono(7,True),fill=RED)
+                c.create_text(nx,ny-r-14,text="H.T.",font=mono(7,True),fill=RED)
 
             if self._show['tensions'].get() and nid in self.node_results:
                 nr=self.node_results[nid]; v=nr["V_pu"]; ang=nr["theta_deg"]
@@ -1155,11 +1747,12 @@ class GridApp:
                 c.create_text(lx,ny+12,text=f"{nr['V_kv']:.2f}kV",
                               font=mono(7),fill=T_SEC,anchor=anc)
 
-        Pl=sum(self.load_vars[l["id"]]['P'].get() for l in LOADS
+        Pl=sum(self.load_vars[l["id"]]['P'].get() for l in self._loads
                if l["id"] in self.load_vars and 'P' in self.load_vars[l["id"]])
-        Ql=sum(self.load_vars[l["id"]]['Q'].get() for l in LOADS
+        Ql=sum(self.load_vars[l["id"]]['Q'].get() for l in self._loads
                if l["id"] in self.load_vars and 'Q' in self.load_vars[l["id"]])
-        c.create_text(W/2,H-10,text=f"Charge totale : {Pl:.0f} MW  /  {Ql:.0f} Mvar",
+        c.create_text(W/2,H-10,
+                      text=f"Total load: {Pl:.0f} MW  /  {Ql:.0f} Mvar",
                       font=mono(8),fill=T_SEC)
 
     def _draw_open_line(self, c, x1, y1, x2, y2, line):
@@ -1200,7 +1793,8 @@ class GridApp:
         c.create_text(lx, ly+6, text="H.T.", font=mono(7,True),
                       fill=RED, anchor='center')
 
-    def _draw_pi_line(self,c,x1,y1,x2,y2,line,lf,lcol,lw,scale):
+    def _draw_pi_line(self,c,x1,y1,x2,y2,line,lf,lcol,lw,scale,n_tot=1,rank=0):
+        """Dessine une ligne avec schéma en π. Les coords passées incluent déjà l'offset parallèle."""
         angle=math.atan2(y2-y1,x2-x1)
         cos_a=math.cos(angle); sin_a=math.sin(angle)
         perp_x=-sin_a; perp_y=cos_a
@@ -1214,6 +1808,12 @@ class GridApp:
         c.create_line(x1,y1,px1,py1,fill=lcol,width=lw)
         c.create_line(px1,py1,px2,py2,fill=lcol,width=lw+0.5)
         c.create_line(px2,py2,x2,y2,fill=lcol,width=lw)
+
+        # Étiquette numéro de ligne si parallèles
+        if n_tot > 1:
+            mx0=(x1+x2)/2; my0=(y1+y2)/2
+            c.create_text(mx0+perp_x*8, my0+perp_y*8,
+                          text=line["id"], font=mono(6), fill=lcol, anchor='center')
 
         if self._show['pi_schema'].get() and abs(Bc)>1e-6:
             for px,py in ((px1,py1),(px2,py2)):
@@ -1262,6 +1862,101 @@ class GridApp:
                 c.create_line(ax-math.cos(fa)*8,ay-math.sin(fa)*8,
                               ax+math.cos(fa)*8,ay+math.sin(fa)*8,
                               fill=lcol,width=2.5,arrow='last',arrowshape=(8,10,4))
+
+    def _draw_transformer(self, c, x1,y1,x2,y2, tid, tr, scale, is_open):
+        """
+        Dessine un transformateur deux enroulements avec :
+          ─── (segment HT) ─ (O)(O) ─ (segment BT) ───
+          Deux cercles accolés au centre représentent les enroulements.
+          Si ouvert : tirets + carré barré rouge.
+          Labels : rapport de transformation, P/Q transit, impédance.
+        """
+        TCOL  = "#e0a020"   # couleur dédiée transformateurs
+        TGRAY = "#444455"
+
+        angle = math.atan2(y2-y1, x2-x1)
+        cos_a = math.cos(angle); sin_a = math.sin(angle)
+        perp_x = -sin_a;         perp_y = cos_a
+        mx = (x1+x2)/2;          my = (y1+y2)/2
+        lw = 2.5
+
+        if is_open:
+            # Tirets gris + symbole ouvert
+            c.create_line(x1,y1,x2,y2, fill=TGRAY, width=2, dash=(6,5))
+            sz=10
+            pts=[mx-cos_a*sz-sin_a*sz, my-sin_a*sz+cos_a*sz,
+                 mx+cos_a*sz-sin_a*sz, my+sin_a*sz+cos_a*sz,
+                 mx+cos_a*sz+sin_a*sz, my+sin_a*sz-cos_a*sz,
+                 mx-cos_a*sz+sin_a*sz, my-sin_a*sz-cos_a*sz]
+            c.create_polygon(*pts, fill=BG, outline=RED, width=2)
+            c.create_line(mx-cos_a*sz+sin_a*sz, my-sin_a*sz-cos_a*sz,
+                          mx+cos_a*sz-sin_a*sz, my+sin_a*sz+cos_a*sz,
+                          fill=RED, width=2)
+            c.create_text(mx+perp_x*18, my+perp_y*18,
+                          text=f"{tid}\nH.T.", font=mono(6,True), fill=RED)
+            return
+
+        # ── Rayon des cercles proportionnel au zoom
+        rcirc = max(8, min(18, int(12*scale)))
+
+        # Points de tangence des cercles sur la ligne
+        t1x = mx - cos_a*rcirc;  t1y = my - sin_a*rcirc   # centre cercle 1 (côté 1)
+        t2x = mx + cos_a*rcirc;  t2y = my + sin_a*rcirc   # centre cercle 2 (côté 2)
+
+        # Segments de connexion nœud → tangence extérieure du cercle
+        c.create_line(x1,y1, t1x-cos_a*rcirc, t1y-sin_a*rcirc,
+                      fill=TCOL, width=lw)
+        c.create_line(t2x+cos_a*rcirc, t2y+sin_a*rcirc, x2,y2,
+                      fill=TCOL, width=lw)
+
+        # Les deux cercles représentant les enroulements
+        loading = tr.get("loading_pct", 0)
+        ring_col = RED if loading>90 else AMBER if loading>70 else TCOL
+        for cx,cy in ((t1x,t1y),(t2x,t2y)):
+            c.create_oval(cx-rcirc, cy-rcirc, cx+rcirc, cy+rcirc,
+                          fill=CARD, outline=ring_col, width=2.5)
+
+        # ── Labels rapport de transformation
+        u1 = tr.get("rated_u1", 0); u2 = tr.get("rated_u2", 0)
+        lx = mx + perp_x*22; ly = my + perp_y*22
+        ratio_txt = f"{tid}"
+        if u1 and u2:
+            ratio_txt += f"  {u1:.0f}/{u2:.0f}kV"
+        for ddx,ddy in ((1,0),(-1,0),(0,1),(0,-1)):
+            c.create_text(lx+ddx,ly-8+ddy, text=ratio_txt,
+                          font=mono(6), fill=BG)
+        c.create_text(lx, ly-8, text=ratio_txt,
+                      font=mono(6,True), fill=TCOL)
+
+        # ── Impédance si activée
+        if self._show['impedances'].get():
+            X_pu = tr.get("X_pu", 0)
+            z_base = (u1**2 / BASE_MVA) if u1 else Z_BASE
+            x_pu_norm = X_pu / z_base if z_base else 0
+            c.create_text(lx, ly+5, text=f"X={x_pu_norm:.4f}pu",
+                          font=mono(6), fill=ORANGE)
+
+        # ── Flux P/Q
+        if self._show['flux'].get():
+            P = tr.get("P_from", 0); Q = tr.get("Q_from", 0)
+            if P==P:   # not NaN
+                fx = mx - perp_x*26; fy = my - perp_y*26
+                for ddx,ddy in ((1,0),(-1,0),(0,1),(0,-1)):
+                    c.create_text(fx+ddx,fy-8+ddy,text=f"P:{P:+.0f}MW",font=mono(7),fill=BG)
+                    c.create_text(fx+ddx,fy+5+ddy,text=f"Q:{Q:+.0f}Mvar",font=mono(7),fill=BG)
+                c.create_text(fx,fy-8, text=f"P:{P:+.0f}MW",  font=mono(7,True),fill=BLUE)
+                c.create_text(fx,fy+5, text=f"Q:{Q:+.0f}Mvar",font=mono(7),     fill=TEAL)
+
+        # ── Flèche de direction
+        if self._show['fleches'].get():
+            P = tr.get("P_from", 0)
+            if P==P and abs(P)>0.5:
+                fa = angle if P>0 else angle+math.pi
+                ax = x1+(x2-x1)*0.55; ay = y1+(y2-y1)*0.55
+                c.create_line(ax-math.cos(fa)*8, ay-math.sin(fa)*8,
+                              ax+math.cos(fa)*8, ay+math.sin(fa)*8,
+                              fill=ring_col, width=2.5,
+                              arrow='last', arrowshape=(8,10,4))
 
     def _draw_shunts(self,c,nx,ny,r,shunts):
         for k,sh in enumerate(shunts):
